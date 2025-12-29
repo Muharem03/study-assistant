@@ -1,2 +1,3 @@
 *.db
 .encryption_key
+data/
