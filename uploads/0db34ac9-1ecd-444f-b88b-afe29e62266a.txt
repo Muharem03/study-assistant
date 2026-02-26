@@ -1,0 +1,1315 @@
+#######document_processor.py
+import PyPDF2
+import docx
+import os
+from typing import List, Dict
+import streamlit as st
+
+class DocumentProcessor:
+    """Klasa për përpunimin e dokumenteve"""
+    
+    def __init__(self):
+        self.supported_types = ['.pdf', '.docx', '.txt']
+    
+    def extract_text_from_pdf(self, file_path: str) -> str:
+        """Ekstrakto tekstin nga PDF"""
+        try:
+            text = ""
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+            return text
+        except Exception as e:
+            st.error(f"Gabim në leximin e PDF: {str(e)}")
+            return ""
+    
+    def extract_text_from_docx(self, file_path: str) -> str:
+        """Ekstrakto tekstin nga DOCX"""
+        try:
+            doc = docx.Document(file_path)
+            text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+            return text
+        except Exception as e:
+            st.error(f"Gabim në leximin e DOCX: {str(e)}")
+            return ""
+    
+    def extract_text_from_txt(self, file_path: str) -> str:
+        """Ekstrakto tekstin nga TXT"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                return file.read()
+        except Exception as e:
+            st.error(f"Gabim në leximin e TXT: {str(e)}")
+            return ""
+    
+    def extract_text(self, file_path: str) -> str:
+        """Ekstrakto tekstin bazuar në tipin e file"""
+        file_extension = os.path.splitext(file_path)[1].lower()
+        
+        if file_extension == '.pdf':
+            return self.extract_text_from_pdf(file_path)
+        elif file_extension == '.docx':
+            return self.extract_text_from_docx(file_path)
+        elif file_extension == '.txt':
+            return self.extract_text_from_txt(file_path)
+        else:
+            st.error(f"Tipi i file '{file_extension}' nuk suportohet!")
+            return ""
+    
+    def save_uploaded_file(self, uploaded_file, doc_id: int) -> str:
+        """Ruaj file të ngarkuar në disk"""
+        try:
+            # Krijo folder nëse nuk ekziston
+            upload_dir = "uploaded_documents"
+            if not os.path.exists(upload_dir):
+                os.makedirs(upload_dir)
+            
+            # Ruaj file me ID unique
+            file_path = os.path.join(upload_dir, f"doc_{doc_id}_{uploaded_file.name}")
+            
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            return file_path
+        except Exception as e:
+            st.error(f"Gabim në ruajtjen e file: {str(e)}")
+            return ""
+    
+    def chunk_text(self, text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
+        """Ndaj tekstin në chunks më të vogla"""
+        chunks = []
+        start = 0
+        text_length = len(text)
+        
+        while start < text_length:
+            end = start + chunk_size
+            chunk = text[start:end]
+            chunks.append(chunk)
+            start = end - chunk_overlap
+        
+        return chunks
+    
+    def get_document_stats(self, text: str) -> Dict:
+        """Merr statistika për dokumentin"""
+        words = text.split()
+        return {
+            "total_characters": len(text),
+            "total_words": len(words),
+            "total_lines": len(text.split('\n'))
+        }
+
+####rag_system.py
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+import os
+import streamlit as st
+from typing import List, Dict, Tuple
+
+
+class RAGSystem:
+    """Retrieval Augmented Generation System me Azure OpenAI"""
+    
+    def __init__(self, azure_config: dict = None):
+        """Inicializo RAG sistemin me Azure OpenAI"""
+        
+        if not azure_config:
+            st.warning("⚠️ Azure OpenAI config nuk është dhënë!")
+            return
+        
+        self.azure_config = azure_config
+        
+        try:
+            # Inicializo embeddings me Azure
+            self.embeddings = AzureOpenAIEmbeddings(
+                azure_deployment=azure_config['embedding_deployment'],
+                openai_api_version=azure_config['api_version'],
+                azure_endpoint=azure_config['endpoint'],
+                api_key=azure_config['api_key']
+            )
+            
+            # Inicializo LLM me Azure
+            self.llm = AzureChatOpenAI(
+                azure_deployment=azure_config['deployment_name'],
+                openai_api_version=azure_config['api_version'],
+                azure_endpoint=azure_config['endpoint'],
+                api_key=azure_config['api_key'],
+                temperature=0.7
+            )
+            
+            # Text splitter
+            self.text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                length_function=len,
+                separators=["\n\n", "\n", ". ", " ", ""]
+            )
+            
+            self.initialized = True
+        
+        except Exception as e:
+            st.error(f"Gabim në inicializimin e RAG: {str(e)}")
+            self.initialized = False
+    
+    def create_vector_store(self, text: str, doc_id: int) -> FAISS:
+        """Krijo vector store nga teksti - optimizuar për dokumente të mëdha"""
+        if not self.initialized:
+            st.error("RAG sistem nuk është inicializuar!")
+            return None
+        
+        try:
+            # Ndaj tekstin në chunks
+            chunks = self.text_splitter.split_text(text)
+            
+            if not chunks:
+                st.error("Nuk u gjetën chunks në dokument!")
+                return None
+            
+            total_chunks = len(chunks)
+            st.info(f"📊 Duke procesuar {total_chunks} chunks...")
+            
+            # Test embeddings me një chunk të vogël
+            try:
+                test_embedding = self.embeddings.embed_query("test")
+                st.success(f"✅ Embeddings funksionojnë! Dimension: {len(test_embedding)}")
+            except Exception as embed_test_error:
+                st.error(f"❌ Embeddings test dështoi: {str(embed_test_error)}")
+                st.info("Verifikoni: API Key, Endpoint, dhe Deployment Name në Settings")
+                return None
+            
+            # Për dokumente të mëdha, proceso në batch
+            BATCH_SIZE = 50  # Proceso 50 chunks në një kohë
+            
+            if total_chunks > BATCH_SIZE:
+                st.info(f"🔄 Dokument i madh - duke procesuar në {(total_chunks // BATCH_SIZE) + 1} batch...")
+                
+                # Progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                vectorstore = None
+                
+                for i in range(0, total_chunks, BATCH_SIZE):
+                    batch_chunks = chunks[i:i + BATCH_SIZE]
+                    batch_metadata = [{"doc_id": doc_id, "chunk_id": j} for j in range(i, i + len(batch_chunks))]
+                    
+                    # Update progress
+                    progress = min((i + BATCH_SIZE) / total_chunks, 1.0)
+                    progress_bar.progress(progress)
+                    status_text.text(f"Procesimi: {i + len(batch_chunks)}/{total_chunks} chunks...")
+                    
+                    if vectorstore is None:
+                        # Krijo vector store me batch-in e parë
+                        vectorstore = FAISS.from_texts(
+                            texts=batch_chunks,
+                            embedding=self.embeddings,
+                            metadatas=batch_metadata
+                        )
+                    else:
+                        # Shto batches të tjerë
+                        temp_store = FAISS.from_texts(
+                            texts=batch_chunks,
+                            embedding=self.embeddings,
+                            metadatas=batch_metadata
+                        )
+                        vectorstore.merge_from(temp_store)
+                
+                progress_bar.progress(1.0)
+                status_text.text(f"✅ Të gjitha {total_chunks} chunks u procesuan!")
+                
+            else:
+                # Për dokumente të vogla, processo direkt
+                vectorstore = FAISS.from_texts(
+                    texts=chunks,
+                    embedding=self.embeddings,
+                    metadatas=[{"doc_id": doc_id, "chunk_id": i} for i in range(len(chunks))]
+                )
+            
+            # Ruaj vector store në disk
+            self.save_vector_store(vectorstore, doc_id)
+            
+            return vectorstore
+        
+        except Exception as e:
+            st.error(f"Gabim në krijimin e vector store: {str(e)}")
+            
+            # Debug info
+            with st.expander("🔍 Detaje teknike (për debugging)"):
+                st.code(f"""
+Error Type: {type(e).__name__}
+Error Message: {str(e)}
+
+Config Check:
+- Endpoint: {self.azure_config.get('endpoint', 'N/A')}
+- Embedding Deployment: {self.azure_config.get('embedding_deployment', 'N/A')}
+- API Version: {self.azure_config.get('api_version', 'N/A')}
+- Total Chunks: {len(chunks) if 'chunks' in locals() else 'N/A'}
+
+Suggestions:
+1. Nëse dokumenti është shumë i madh (>15 MB), provoni të prisni më gjatë
+2. Verifikoni që Embedding Deployment është deployed në Azure
+3. Kontrolloni që API key është valid
+4. Nëse gabimi vazhdon, provoni dokument më të vogël për test
+                """)
+            
+            return None
+    
+    def save_vector_store(self, vectorstore: FAISS, doc_id: int):
+        """Ruaj vector store në disk"""
+        try:
+            store_dir = "vector_stores"
+            if not os.path.exists(store_dir):
+                os.makedirs(store_dir)
+            
+            store_path = os.path.join(store_dir, f"vectorstore_{doc_id}")
+            vectorstore.save_local(store_path)
+            
+        except Exception as e:
+            st.error(f"Gabim në ruajtjen e vector store: {str(e)}")
+    
+    def load_vector_store(self, doc_id: int) -> FAISS:
+        """Ngarko vector store nga disk"""
+        if not self.initialized:
+            st.error("RAG sistem nuk është inicializuar!")
+            return None
+        
+        try:
+            store_path = os.path.join("vector_stores", f"vectorstore_{doc_id}")
+            
+            if not os.path.exists(store_path):
+                st.error(f"Vector store për dokument {doc_id} nuk ekziston!")
+                return None
+            
+            vectorstore = FAISS.load_local(
+                store_path,
+                self.embeddings,
+                allow_dangerous_deserialization=True
+            )
+            
+            return vectorstore
+        
+        except Exception as e:
+            st.error(f"Gabim në ngarkimin e vector store: {str(e)}")
+            return None
+    
+    def create_qa_chain(self, vectorstore: FAISS):
+        """Krijo QA chain për RAG - Version i thjeshtë"""
+        
+        # Krijo retriever
+        retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 3}
+        )
+        
+        # Prompt template
+        template = """Ju jeni një asistent inteligjent edukativ. Përdorni kontekstin më poshtë për t'iu përgjigjur pyetjes.
+
+Konteksti:
+{context}
+
+Pyetja: {question}
+
+Udhëzime:
+- Jepni përgjigje të detajuara dhe të sakta
+- Nëse përgjigja nuk gjendet në kontekst, thoni "Nuk gjeta informacion për këtë në dokument"
+- Përdorni gjuhë të thjeshtë
+
+Përgjigja:"""
+
+        prompt = ChatPromptTemplate.from_template(template)
+        
+        # Funksion helper për të formatuar dokumentet
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
+        
+        # Krijo chain manual
+        rag_chain = (
+            {
+                "context": retriever | format_docs,
+                "question": RunnablePassthrough()
+            }
+            | prompt
+            | self.llm
+            | StrOutputParser()
+        )
+        
+        return rag_chain, retriever
+    
+    def ask_question(self, question: str, doc_id: int) -> Tuple[str, List[str]]:
+        """Bëj pyetje mbi dokumentin"""
+        if not self.initialized:
+            return "Gabim: RAG sistem nuk është inicializuar!", []
+        
+        try:
+            # Ngarko vector store
+            vectorstore = self.load_vector_store(doc_id)
+            
+            if vectorstore is None:
+                return "Gabim: Vector store nuk u gjet!", []
+            
+            # Krijo QA chain dhe retriever
+            qa_chain, retriever = self.create_qa_chain(vectorstore)
+            
+            # Merr dokumentet relevante për referenca
+            relevant_docs = retriever.invoke(question)
+            
+            # Merr përgjigjen nga chain
+            answer = qa_chain.invoke(question)
+            
+            # Ekstrakto sources
+            sources = []
+            for doc in relevant_docs[:3]:  # First 3 sources
+                sources.append(doc.page_content[:200] + "...")
+            
+            return answer, sources
+        
+        except Exception as e:
+            error_msg = f"Gabim në procesimin e pyetjes: {str(e)}"
+            st.error(error_msg)
+            
+            # Debug info
+            with st.expander("🔍 Debug Info"):
+                st.code(f"""
+Error: {type(e).__name__}
+Message: {str(e)}
+
+Config:
+- Endpoint: {self.azure_config.get('endpoint', 'N/A')}
+- Deployment: {self.azure_config.get('deployment_name', 'N/A')}
+                """)
+            
+            return error_msg, []
+    
+    def generate_quiz_questions(self, text: str, num_questions: int = 5, difficulty: str = "Mesatare") -> List[Dict]:
+        """Gjenero pyetje kuizi nga teksti me Azure OpenAI"""
+        if not self.initialized:
+            st.error("RAG sistem nuk është inicializuar!")
+            return []
+        
+        try:
+            # Prompt për gjenerimin e kuizit
+            difficulty_instructions = {
+                "E lehtë": "Krijoni pyetje të thjeshta që testojnë kuptimin bazë të koncepteve.",
+                "Mesatare": "Krijoni pyetje që kërkojnë kuptim më të thellë dhe aftësi analize.",
+                "E vështirë": "Krijoni pyetje sfidëse që kërkojnë arsyetim kritik dhe aplikim të njohurive."
+            }
+            
+            prompt = f"""Ju jeni një mësues që krijon kuize për studentët. Bazuar në tekstin më poshtë, krijoni {num_questions} pyetje multiple choice në gjuhën shqipe.
+
+TEKSTI:
+{text[:3000]}
+
+UDHËZIME:
+- Niveli i vështirësisë: {difficulty}
+- {difficulty_instructions.get(difficulty, '')}
+- Çdo pyetje duhet të ketë 4 opsione (A, B, C, D)
+- Vetëm një përgjigje e saktë për pyetje
+- Jepni një shpjegim të shkurtër për përgjigjen e saktë
+
+FORMATI I KTHIMIT (shumë i rëndësishëm):
+Pyetja 1: [Teksti i pyetjes këtu]
+A) [Opsioni A]
+B) [Opsioni B]
+C) [Opsioni C]
+D) [Opsioni D]
+Përgjigja e saktë: [shkronja]
+Shpjegim: [Arsyeja pse kjo është e saktë]
+
+---
+
+Filloni të gjeneroni {num_questions} pyetje:"""
+
+            # Gjenero me Azure OpenAI
+            from openai import AzureOpenAI
+            
+            client = AzureOpenAI(
+                api_key=self.azure_config['api_key'],
+                api_version=self.azure_config['api_version'],
+                azure_endpoint=self.azure_config['endpoint']
+            )
+            
+            response = client.chat.completions.create(
+                model=self.azure_config['deployment_name'],
+                messages=[
+                    {"role": "system", "content": "Ju jeni një mësues ekspert që krijon kuize cilësore edukative."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=2000
+            )
+            
+            quiz_text = response.choices[0].message.content
+            
+            # Parse përgjigjen
+            questions = self._parse_quiz_response(quiz_text)
+            
+            return questions
+        
+        except Exception as e:
+            st.error(f"Gabim në gjenerimin e kuizit: {str(e)}")
+            return []
+    
+    def _parse_quiz_response(self, response: str) -> List[Dict]:
+        """Parse përgjigjen e AI për kuiz"""
+        questions = []
+        
+        # Split në pyetje individuale
+        quiz_sections = response.split('---')
+        
+        for section in quiz_sections:
+            if not section.strip():
+                continue
+            
+            lines = section.strip().split('\n')
+            current_question = {
+                'question': '',
+                'options': [],
+                'correct_answer': '',
+                'explanation': ''
+            }
+            
+            for line in lines:
+                line = line.strip()
+                
+                if line.startswith('Pyetja') and ':' in line:
+                    # Ekstrakto pyetjen
+                    current_question['question'] = line.split(':', 1)[1].strip()
+                
+                elif line.startswith(('A)', 'B)', 'C)', 'D)')):
+                    # Opsionet
+                    current_question['options'].append(line)
+                
+                elif line.startswith('Përgjigja e saktë:'):
+                    # Përgjigja e saktë
+                    current_question['correct_answer'] = line.split(':', 1)[1].strip()
+                
+                elif line.startswith('Shpjegim:'):
+                    # Shpjegimi
+                    current_question['explanation'] = line.split(':', 1)[1].strip()
+            
+            # Shto pyetjen nëse është e plotë
+            if current_question['question'] and current_question['options']:
+                questions.append(current_question)
+        
+        return questions
+    
+    def generate_flashcards(self, text: str, num_cards: int = 10) -> List[Dict]:
+        """Gjenero flashcards nga teksti"""
+        if not self.initialized:
+            st.error("RAG sistem nuk është inicializuar!")
+            return []
+        
+        try:
+            prompt = f"""Bazuar në tekstin më poshtë, krijo {num_cards} flashcards (pyetje-përgjigje) për të ndihmuar studentët të mësojnë.
+
+TEKSTI:
+{text}
+
+UDHËZIME:
+- Krijo flashcards që testojnë koncepte kyçe
+- Pyetjet duhet të jenë të qarta dhe koncize
+- Përgjigjet duhet të jenë të plota por jo shumë të gjata
+- Përdor gjuhën shqipe
+
+FORMATI (shumë i rëndësishëm):
+Flashcard 1:
+Q: [Pyetja këtu]
+A: [Përgjigja këtu]
+
+---
+
+Flashcard 2:
+Q: [Pyetja këtu]
+A: [Përgjigja këtu]
+
+---
+
+Fillo të gjenerosh {num_cards} flashcards:"""
+
+            # Gjenero me Azure OpenAI
+            from openai import AzureOpenAI
+            
+            client = AzureOpenAI(
+                api_key=self.azure_config['api_key'],
+                api_version=self.azure_config['api_version'],
+                azure_endpoint=self.azure_config['endpoint']
+            )
+            
+            response = client.chat.completions.create(
+                model=self.azure_config['deployment_name'],
+                messages=[
+                    {"role": "system", "content": "Ju jeni një mësues ekspert që krijon flashcards cilësore."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=2000
+            )
+            
+            flashcard_text = response.choices[0].message.content
+            
+            # Parse përgjigjen
+            flashcards = self._parse_flashcard_response(flashcard_text)
+            
+            return flashcards
+        
+        except Exception as e:
+            st.error(f"Gabim në gjenerimin e flashcards: {str(e)}")
+            return []
+    
+    def _parse_flashcard_response(self, response: str) -> List[Dict]:
+        """Parse përgjigjen e AI për flashcards"""
+        flashcards = []
+        
+        # Split në flashcards individuale
+        cards = response.split('---')
+        
+        for card in cards:
+            if not card.strip():
+                continue
+            
+            lines = card.strip().split('\n')
+            question = ""
+            answer = ""
+            
+            for line in lines:
+                line = line.strip()
+                
+                if line.startswith('Q:'):
+                    question = line[2:].strip()
+                elif line.startswith('A:'):
+                    answer = line[2:].strip()
+            
+            if question and answer:
+                flashcards.append({
+                    'question': question,
+                    'answer': answer
+                })
+        
+        return flashcards
+
+
+
+######chat.py
+
+import streamlit as st
+from database.db_manager import (
+    get_user_documents, 
+    get_document_processing_status,
+    save_chat_message,
+    get_chat_history
+)
+from utils.rag_system import RAGSystem
+from config.api_settings import APISettings
+
+def show():
+    """Shfaq faqen e chat"""
+    
+    st.markdown("# 💬 Chat me AI Asistentin")
+    st.markdown("---")
+    
+    # Check Azure OpenAI configuration
+    api_settings = APISettings()
+    
+    if not api_settings.is_configured():
+        st.error("❌ Azure OpenAI nuk është konfiguruar!")
+        st.info("Shkoni te Settings në sidebar dhe konfiguroni Azure OpenAI.")
+        return
+    
+    # Check nëse ka dokumente
+    docs = get_user_documents(st.session_state.user_id)
+    
+    if not docs:
+        st.warning("⚠️ Ju lutem ngarkoni së pari një dokument për të filluar chat-in!")
+        if st.button("📚 Shko te Dokumentet"):
+            st.session_state.dashboard_tab = 'documents'
+            st.rerun()
+        return
+    
+    # Filtro vetëm dokumentet e procesuara
+    processed_docs = []
+    for doc in docs:
+        status = get_document_processing_status(doc[0])
+        if status and status[4]:  # embeddings_created
+            processed_docs.append(doc)
+    
+    if not processed_docs:
+        st.warning("⚠️ Nuk keni dokumente të procesuara! Shkoni te Dokumentet dhe procesoni një dokument.")
+        if st.button("📚 Shko te Dokumentet"):
+            st.session_state.dashboard_tab = 'documents'
+            st.rerun()
+        return
+    
+    # Zgjidh dokumentin - FIX: Use correct index for filename
+    st.markdown("### 📄 Zgjidh Dokumentin")
+    
+    # Create mapping: display name -> (doc_id, full_doc_data)
+    doc_mapping = {}
+    for doc in processed_docs:
+        # doc structure: [id, user_id, subject_id, filename, file_type, upload_date, file_size, subject_name, subject_color]
+        doc_id = doc[0]
+        filename = doc[3]  # Index 3 is filename
+        
+        # Add subject info if available
+        subject_name = doc[7] if len(doc) > 7 and doc[7] else None
+        
+        if subject_name:
+            display_name = f"📂 {subject_name} / {filename}"
+        else:
+            display_name = f"📄 {filename}"
+        
+        doc_mapping[display_name] = (doc_id, doc)
+    
+    selected_display_name = st.selectbox(
+        "Dokument",
+        list(doc_mapping.keys()),
+        key="chat_doc_selector"
+    )
+    
+    selected_doc_id, selected_doc_data = doc_mapping[selected_display_name]
+    selected_doc_name = selected_doc_data[3]  # Actual filename
+    
+    st.markdown("---")
+    
+    # Chat interface
+    st.markdown("### 💭 Bëj Pyetjen Tënde")
+    
+    # Initialize chat history për këtë dokument (nga database)
+    chat_key = f'chat_history_{selected_doc_id}'
+    
+    # Load chat history nga database nëse nuk është në session state
+    if chat_key not in st.session_state:
+        # Merr historikun nga database
+        db_history = get_chat_history(st.session_state.user_id, selected_doc_id)
+        
+        # Convert në format të session state
+        st.session_state[chat_key] = []
+        if db_history:
+            for row in db_history:
+                role, content, timestamp = row
+                st.session_state[chat_key].append({
+                    'role': role,
+                    'content': content,
+                    'timestamp': timestamp
+                })
+    
+    # Chat container
+    chat_container = st.container()
+    
+    with chat_container:
+        for message in st.session_state[chat_key]:
+            if message['role'] == 'user':
+                with st.chat_message("user"):
+                    st.markdown(message['content'])
+                    # Shfaq timestamp nëse ka
+                    if 'timestamp' in message:
+                        st.caption(f"🕐 {message['timestamp'][:16]}")
+            else:
+                with st.chat_message("assistant"):
+                    st.markdown(message['content'])
+                    
+                    # Shfaq timestamp nëse ka
+                    if 'timestamp' in message:
+                        st.caption(f"🕐 {message['timestamp'][:16]}")
+                    
+                    # Shfaq sources nëse ka
+                    if 'sources' in message and message['sources']:
+                        with st.expander("📚 Referenca nga Dokumenti"):
+                            for i, source in enumerate(message['sources'], 1):
+                                st.markdown(f"**Referenca {i}:**")
+                                st.text(source)
+                                st.markdown("---")
+    
+    # Input
+    user_question = st.chat_input("Shkruaj pyetjen tuaj...", key=f"chat_input_{selected_doc_id}")
+    
+    if user_question:
+        # Shto pyetjen në history
+        st.session_state[chat_key].append({
+            'role': 'user',
+            'content': user_question
+        })
+        
+        # Ruaj në database
+        save_chat_message(
+            st.session_state.user_id,
+            selected_doc_id,
+            'user',
+            user_question
+        )
+        
+        # Shfaq pyetjen e përdoruesit
+        with st.chat_message("user"):
+            st.markdown(user_question)
+        
+        # Merr përgjigjen nga RAG me Azure
+        with st.chat_message("assistant"):
+            with st.spinner("Duke menduar..."):
+                azure_config = api_settings.get_settings()
+                rag_system = RAGSystem(azure_config=azure_config)
+                answer, sources = rag_system.ask_question(user_question, selected_doc_id)
+                
+                st.markdown(answer)
+                
+                # Shfaq sources
+                if sources:
+                    with st.expander("📚 Referenca nga Dokumenti"):
+                        for i, source in enumerate(sources, 1):
+                            st.markdown(f"**Referenca {i}:**")
+                            st.text(source)
+                            st.markdown("---")
+        
+        # Ruaj përgjigjen në history dhe database
+        st.session_state[chat_key].append({
+            'role': 'assistant',
+            'content': answer,
+            'sources': sources
+        })
+        
+        save_chat_message(
+            st.session_state.user_id,
+            selected_doc_id,
+            'assistant',
+            answer
+        )
+        
+        st.rerun()
+    
+    # Clear chat button
+    col1, col2, col3 = st.columns([4, 1, 1])
+    with col2:
+        if st.button("🗑️ Pastro Chat", use_container_width=True):
+            # Fshi nga session state
+            st.session_state[chat_key] = []
+            
+            # Fshi nga database
+            conn = st.session_state.db_conn
+            c = conn.cursor()
+            c.execute('DELETE FROM chat_history WHERE user_id = ? AND document_id = ?',
+                     (st.session_state.user_id, selected_doc_id))
+            conn.commit()
+            
+            st.success("✅ Chat history u fshi!")
+            st.rerun()
+    
+    with col3:
+        # Export chat button
+        if st.button("📥 Eksporto", use_container_width=True):
+            if st.session_state[chat_key]:
+                # Krijo tekst për export
+                export_text = f"CHAT HISTORY - {selected_doc_name}\n"
+                export_text += f"{'='*50}\n\n"
+                
+                for msg in st.session_state[chat_key]:
+                    if msg['role'] == 'user':
+                        export_text += f"👤 JU: {msg['content']}\n\n"
+                    else:
+                        export_text += f"🤖 AI: {msg['content']}\n\n"
+                    export_text += "-"*50 + "\n\n"
+                
+                st.download_button(
+                    label="💾 Shkarko TXT",
+                    data=export_text,
+                    file_name=f"chat_{selected_doc_name}_{st.session_state.user_name}.txt",
+                    mime="text/plain"
+                )
+            else:
+                st.info("Nuk ka chat history për të eksportuar")
+    
+    # Tips
+    with st.expander("💡 Tips për Chat"):
+        st.markdown("""
+        **Si të bëni pyetje të mira:**
+        - Bëni pyetje specifike dhe të qarta
+        - Referohuni përmbajtjes së dokumentit
+        - Kërkoni shembuj ose shpjegime të detajuara
+        
+        **Shembuj pyetjesh:**
+        - "Çfarë thotë dokumenti për [temë]?"
+        - "Mund të më jepësh një shembull të [koncept]?"
+        - "Cilat janë pikat kryesore që diskutohen?"
+        - "Si e shpjegon dokumenti [term]?"
+        """)
+
+
+#####flashcard.py
+
+import streamlit as st
+from database.db_manager import (
+    get_user_documents, 
+    get_document_processing_status,
+    save_flashcard_set,
+    get_user_flashcards,
+    get_flashcard_items,
+    delete_flashcard_set
+)
+from utils.rag_system import RAGSystem
+from utils.document_processor import DocumentProcessor
+from config.api_settings import APISettings
+import random
+def show_study_mode(fc_id: int):
+    """Study mode për flashcards"""
+    
+    # Load flashcard set info
+    from database.db_manager import get_user_flashcards
+    
+    user_flashcards = get_user_flashcards(st.session_state.user_id)
+    
+    # Find the selected set
+    selected_set = None
+    for fc_set in user_flashcards:
+        if fc_set[0] == fc_id:
+            selected_set = fc_set
+            break
+    
+    if not selected_set:
+        st.error("Flashcard set nuk u gjet!")
+        if st.button("« Kthehu"):
+            st.session_state.study_mode_fc_id = None
+            st.rerun()
+        return
+    
+    fc_id, user_id, doc_id, title, num_cards, created_at, doc_name = selected_set
+    
+    # Header
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        st.markdown(f"# 📖 Study Mode: {title}")
+        st.caption(f"📄 {doc_name} | {num_cards} cards")
+    with col2:
+        if st.button("« Kthehu", use_container_width=True):
+            st.session_state.study_mode_fc_id = None
+            # Reset study state
+            if 'study_current_index' in st.session_state:
+                del st.session_state.study_current_index
+            if 'study_show_answer' in st.session_state:
+                del st.session_state.study_show_answer
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Load cards from database
+    cards_data = get_flashcard_items(fc_id)
+    
+    if not cards_data:
+        st.error("Nuk ka cards në këtë set!")
+        return
+    
+    # Convert to list of dicts
+    cards = [{'id': c[0], 'question': c[1], 'answer': c[2], 'order': c[3]} for c in cards_data]
+    
+    # Initialize study session state
+    if 'study_current_index' not in st.session_state:
+        st.session_state.study_current_index = 0
+    
+    if 'study_show_answer' not in st.session_state:
+        st.session_state.study_show_answer = False
+    
+    if 'study_mastered' not in st.session_state:
+        st.session_state.study_mastered = set()
+    
+    current_index = st.session_state.study_current_index
+    
+    # Progress bar
+    progress = (current_index + 1) / len(cards)
+    st.progress(progress)
+    
+    col_prog1, col_prog2, col_prog3 = st.columns(3)
+    with col_prog1:
+        st.metric("Karta", f"{current_index + 1}/{len(cards)}")
+    with col_prog2:
+        st.metric("Mastered", len(st.session_state.study_mastered))
+    with col_prog3:
+        st.metric("Remaining", len(cards) - len(st.session_state.study_mastered))
+    
+    st.markdown("---")
+    
+    # Current card
+    if current_index < len(cards):
+        card = cards[current_index]
+        
+        # Card container with styling
+        if not st.session_state.study_show_answer:
+            # Front of card (question)
+            st.markdown("""
+            <div style="
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                padding: 3rem;
+                border-radius: 1rem;
+                text-align: center;
+                min-height: 250px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            ">
+                <h2 style="color: white; margin: 0;">❓ PYETJA</h2>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            st.info(f"### {card['question']}")
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            if st.button("🔄 Shfaq Përgjigjen", use_container_width=True, type="primary", key="show_answer"):
+                st.session_state.study_show_answer = True
+                st.rerun()
+        
+        else:
+            # Back of card (answer)
+            st.markdown("""
+            <div style="
+                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+                padding: 3rem;
+                border-radius: 1rem;
+                text-align: center;
+                min-height: 250px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            ">
+                <h2 style="color: white; margin: 0;">✅ PËRGJIGJA</h2>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            st.info(f"### {card['question']}")
+            st.success(f"### {card['answer']}")
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            # Self-assessment
+            st.markdown("### 🎯 Si ishte?")
+            col_know, col_review = st.columns(2)
+            
+            with col_know:
+                if st.button("✅ E dija!", use_container_width=True, type="primary", key="know_it"):
+                    st.session_state.study_mastered.add(current_index)
+                    go_next_card(len(cards))
+            
+            with col_review:
+                if st.button("📚 Duhet ta rishikoj", use_container_width=True, key="review_it"):
+                    # Remove from mastered if it was there
+                    st.session_state.study_mastered.discard(current_index)
+                    go_next_card(len(cards))
+        
+        st.markdown("---")
+        
+        # Navigation
+        col_nav1, col_nav2, col_nav3, col_nav4 = st.columns(4)
+        
+        with col_nav1:
+            if st.button("⬅️ Mëparshme", disabled=(current_index == 0), use_container_width=True):
+                st.session_state.study_current_index = max(0, current_index - 1)
+                st.session_state.study_show_answer = False
+                st.rerun()
+        
+        with col_nav2:
+            if st.button("🔀 Rastësor", use_container_width=True):
+                st.session_state.study_current_index = random.randint(0, len(cards) - 1)
+                st.session_state.study_show_answer = False
+                st.rerun()
+        
+        with col_nav3:
+            if st.button("🔄 Reset Progress", use_container_width=True):
+                st.session_state.study_mastered = set()
+                st.session_state.study_current_index = 0
+                st.session_state.study_show_answer = False
+                st.success("✅ Progress u resetua!")
+                st.rerun()
+        
+        with col_nav4:
+            if st.button("Tjetra ➡️", disabled=(current_index >= len(cards) - 1), use_container_width=True):
+                go_next_card(len(cards))
+    
+    else:
+        # Completed all cards
+        st.success("🎉 Përgëzime! Keni studiuar të gjitha kartat!")
+        
+        col_res1, col_res2 = st.columns(2)
+        with col_res1:
+            st.metric("Total Cards", len(cards))
+        with col_res2:
+            st.metric("Mastered", len(st.session_state.study_mastered))
+        
+        percentage = (len(st.session_state.study_mastered) / len(cards)) * 100
+        st.progress(percentage / 100)
+        st.info(f"📊 {percentage:.0f}% Mastered")
+        
+        if st.button("🔄 Studjo Përsëri", type="primary", use_container_width=True):
+            st.session_state.study_current_index = 0
+            st.session_state.study_show_answer = False
+            st.rerun()
+
+def go_next_card(total_cards):
+    """Navigate to next card"""
+    st.session_state.study_current_index = min(st.session_state.study_current_index + 1, total_cards - 1)
+    st.session_state.study_show_answer = False
+    st.rerun()
+
+
+def show():
+    """Shfaq faqen e flashcards"""
+    
+    st.markdown("# 🎴 Gjenerimi i Flashcards")
+    st.markdown("---")
+    
+    # Check nëse jemi në study mode
+    if 'study_mode_fc_id' in st.session_state and st.session_state.study_mode_fc_id:
+        show_study_mode(st.session_state.study_mode_fc_id)
+        return
+    
+    # Normal mode (create new flashcards)
+    # Check Azure OpenAI configuration
+    api_settings = APISettings()
+    
+    if not api_settings.is_configured():
+        st.error("❌ Azure OpenAI nuk është konfiguruar!")
+        st.info("Shkoni te Settings në sidebar dhe konfiguroni Azure OpenAI.")
+        return
+    
+    # Check nëse ka dokumente
+    docs = get_user_documents(st.session_state.user_id)
+    
+    if not docs:
+        st.warning("⚠️ Ju lutem ngarkoni së pari një dokument për të krijuar flashcards!")
+        if st.button("📚 Shko te Dokumentet"):
+            st.session_state.dashboard_tab = 'documents'
+            st.rerun()
+        return
+    
+    # Filtro dokumentet e procesuara
+    processed_docs = []
+    for doc in docs:
+        status = get_document_processing_status(doc[0])
+        if status and status[3]:  # text_extracted
+            processed_docs.append(doc)
+    
+    if not processed_docs:
+        st.warning("⚠️ Nuk keni dokumente të procesuara!")
+        if st.button("📚 Shko te Dokumentet"):
+            st.session_state.dashboard_tab = 'documents'
+            st.rerun()
+        return
+    
+    # Shfaq historikun e flashcards
+    st.markdown("### 🗂️ Flashcard Sets e Mia")
+    
+    try:
+        user_flashcards = get_user_flashcards(st.session_state.user_id)
+        
+        if user_flashcards:
+            for flashcard_set in user_flashcards[:5]:
+                fc_id, user_id, doc_id, title, num_cards, created_at, doc_name = flashcard_set
+                
+                with st.expander(f"🎴 {title}"):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Cards", num_cards)
+                    with col2:
+                        st.caption(f"📅 {created_at[:10]}")
+                    with col3:
+                        st.caption(f"📄 {doc_name[:20]}")
+                    
+                    col_btn1, col_btn2 = st.columns(2)
+                    
+                    with col_btn1:
+                        if st.button(f"📖 Studjo", key=f"study_{fc_id}", use_container_width=True, type="primary"):
+                            st.session_state.study_mode_fc_id = fc_id
+                            st.rerun()
+                    
+                    with col_btn2:
+                        if st.button(f"🗑️ Fshi", key=f"delete_{fc_id}", use_container_width=True):
+                            delete_flashcard_set(fc_id)
+                            st.success("✅ Flashcard set u fshi!")
+                            st.rerun()
+        else:
+            st.info("📭 Nuk keni krijuar asnjë flashcard set ende.")
+    
+    except Exception as e:
+        st.error(f"Gabim: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Zgjidh dokumentin
+    st.markdown("### 📄 Krijo Flashcard Set të Ri")
+    doc_options = {f"{doc[2]}": doc[0] for doc in processed_docs}
+    selected_doc_name = st.selectbox("Dokument", list(doc_options.keys()), key="flashcard_doc")
+    selected_doc_id = doc_options[selected_doc_name]
+    
+    st.markdown("---")
+    
+    # Opsionet e flashcards
+    st.markdown("### ⚙️ Konfiguro Flashcards")
+    
+    num_cards = st.slider("Numri i kartave", 5, 20, 10)
+    
+    st.markdown("---")
+    
+    # Generate button
+    if st.button("🎴 Gjenero Flashcards", type="primary", use_container_width=True):
+        azure_config = api_settings.get_settings()
+        generate_flashcards(selected_doc_id, selected_doc_name, num_cards, azure_config)
+    
+    # Shfaq flashcards nëse ekzistojnë në session state
+    flashcard_key = f'flashcards_{selected_doc_id}'
+    if flashcard_key in st.session_state and st.session_state[flashcard_key]:
+        display_flashcards(flashcard_key, selected_doc_name)
+
+def generate_flashcards(doc_id: int, doc_name: str, num_cards: int, azure_config: dict):
+    """Gjenero flashcards të reja"""
+    with st.spinner("🎴 Duke gjeneruar flashcards... Ju lutemi prisni..."):
+        try:
+            # Merr tekstin e dokumentit
+            status = get_document_processing_status(doc_id)
+            if not status:
+                st.error("Dokumenti nuk është procesuar!")
+                return
+            
+            file_path = status[2]
+            processor = DocumentProcessor()
+            text = processor.extract_text(file_path)
+            
+            if not text:
+                st.error("Nuk u gjet tekst në dokument!")
+                return
+            
+            # Përdor sample për shpejtësi
+            text_sample = text[:4000]
+            
+            # Gjenero flashcards
+            rag_system = RAGSystem(azure_config=azure_config)
+            flashcards = rag_system.generate_flashcards(text_sample, num_cards)
+            
+            if flashcards:
+                # Ruaj në database me cards data
+                fc_title = f"Flashcards - {doc_name[:30]}"
+                
+                try:
+                    fc_id = save_flashcard_set(
+                        st.session_state.user_id,
+                        doc_id,
+                        fc_title,
+                        len(flashcards),
+                        flashcards  # Pass cards data
+                    )
+                    st.success(f"✅ Set u ruajt në database! ID: {fc_id}")
+                except Exception as db_error:
+                    st.error(f"Gabim në ruajtje: {str(db_error)}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    fc_id = None
+                
+                # Ruaj në session state për display direkt
+                flashcard_key = f'flashcards_{doc_id}'
+                st.session_state[flashcard_key] = {
+                    'fc_id': fc_id,
+                    'cards': flashcards,
+                    'doc_name': doc_name,
+                    'current_index': 0
+                }
+                
+                st.success(f"✅ U gjeneruan {len(flashcards)} flashcards!")
+                st.rerun()
+            else:
+                st.error("Nuk u gjeneruan flashcards. Provoni përsëri.")
+        
+        except Exception as e:
+            st.error(f"Gabim: {str(e)}")
+
+def display_flashcards(flashcard_key: str, doc_name: str):
+    """Shfaq flashcards në mënyrë interaktive"""
+    flashcard_data = st.session_state[flashcard_key]
+    cards = flashcard_data['cards']
+    current_index = flashcard_data.get('current_index', 0)
+    
+    st.markdown("---")
+    st.markdown(f"### 🎴 Flashcards: {doc_name}")
+    
+    if not cards:
+        st.info("Nuk ka flashcards.")
+        return
+    
+    # Progress
+    st.progress((current_index + 1) / len(cards))
+    st.caption(f"Karta {current_index + 1} / {len(cards)}")
+    
+    # Current card
+    card = cards[current_index]
+    
+    # Flip functionality
+    if 'show_answer' not in st.session_state:
+        st.session_state.show_answer = False
+    
+    # Card display
+    st.markdown("---")
+    
+    if not st.session_state.show_answer:
+        # Show question (front)
+        st.markdown("### ❓ Pyetja:")
+        st.info(card.get('question', 'N/A'))
+        
+        if st.button("🔄 Shfaq Përgjigjen", use_container_width=True, type="primary"):
+            st.session_state.show_answer = True
+            st.rerun()
+    else:
+        # Show answer (back)
+        st.markdown("### ❓ Pyetja:")
+        st.info(card.get('question', 'N/A'))
+        
+        st.markdown("### ✅ Përgjigja:")
+        st.success(card.get('answer', 'N/A'))
+        
+        if st.button("🔄 Fsheh Përgjigjen", use_container_width=True):
+            st.session_state.show_answer = False
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Navigation
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("⬅️ Mëparshme", disabled=(current_index == 0), use_container_width=True):
+            flashcard_data['current_index'] = current_index - 1
+            st.session_state.show_answer = False
+            st.rerun()
+    
+    with col2:
+        if st.button("🔀 Rastësor", use_container_width=True):
+            import random
+            flashcard_data['current_index'] = random.randint(0, len(cards) - 1)
+            st.session_state.show_answer = False
+            st.rerun()
+    
+    with col3:
+        if st.button("Tjetra ➡️", disabled=(current_index >= len(cards) - 1), use_container_width=True):
+            flashcard_data['current_index'] = current_index + 1
+            st.session_state.show_answer = False
+            st.rerun()
+    
+    # Export
+    st.markdown("---")
+    if st.button("📥 Eksporto Flashcards", use_container_width=True):
+        export_text = f"FLASHCARDS - {doc_name}\n{'='*50}\n\n"
+        
+        for i, card in enumerate(cards, 1):
+            export_text += f"KARTA {i}\n"
+            export_text += f"Pyetja: {card.get('question', 'N/A')}\n"
+            export_text += f"Përgjigja: {card.get('answer', 'N/A')}\n"
+            export_text += "-"*50 + "\n\n"
+        
+        st.download_button(
+            label="💾 Shkarko TXT",
+            data=export_text,
+            file_name=f"flashcards_{doc_name}.txt",
+            mime="text/plain"
+        )
